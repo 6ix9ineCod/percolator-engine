@@ -11,3 +11,7 @@ percolator = { path = "../percolator", features = ["test"] }
 percolator-insurance = { path = "../percolator/percolator-insurance", features = ["serde"] }
 percolator-feed = { path = "../percolator-feed" }
 percolator-equity = { path = "../percolator-equity" }
+
+[[bin]]
+name = "engine"
+required-features = ["fixtures"]

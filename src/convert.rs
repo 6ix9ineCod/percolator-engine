@@ -43,7 +43,7 @@ pub struct EngineGates {
 /// Confidence-modulated warmup is a documented follow-up — the confidence signal
 /// still reaches the engine via equity's `extraction_warmup` and `mark_conf`.
 pub fn feed_to_engine(tick: &FeedTick, cfg: &ConvertCfg) -> EngineInputs {
-    let clamp = |p: u64| p.min(MAX_ORACLE_PRICE).max(1);
+    let clamp = |p: u64| p.clamp(1, MAX_ORACLE_PRICE);
     EngineInputs {
         oracle_price: clamp(tick.fast_price),
         extraction_price: clamp(tick.extraction_price),
