@@ -14,6 +14,11 @@ pub enum Violation {
     /// enter the closed period unprotected against the reopen gap. Breakable by a
     /// surcharge misconfiguration — the red-team's primary target.
     ReopenBufferMissing,
+    /// The pool's recorded premium claim exceeds the actual insurance fund balance
+    /// backing it — the fund cannot honour what the pool thinks it holds. Maintained
+    /// by `reconcile_pool`; breaks when reconciliation is skipped while the fund is
+    /// drawn down (the phantom-payout / under-reconciliation class).
+    Insolvency,
 }
 
 /// Check the cross-crate contract against the engine's current state.
@@ -27,6 +32,11 @@ pub fn check(eng: &PercolatorEngine) -> Result<(), Violation> {
     let unprotected = g.reopen_gap_margin == 0 && g.extraction_warmup == 0;
     if !g.allow_open && !g.mark_underlying && unprotected {
         return Err(Violation::ReopenBufferMissing);
+    }
+    // 3. Solvency: the pool's claim cannot exceed the fund balance backing it.
+    let fund = eng.insurer.engine.insurance_fund.balance.get();
+    if eng.insurer.pool.balance > fund {
+        return Err(Violation::Insolvency);
     }
     Ok(())
 }
@@ -81,5 +91,52 @@ mod tests {
         let mut e = PercolatorEngine::new(c, 0);
         e.tick(&[], CalendarState::Closed, 1, 1);
         assert_eq!(check(&e), Err(Violation::ReopenBufferMissing));
+    }
+
+    #[test]
+    fn solvency_holds_with_premium_lifecycle_running() {
+        // Reconcile on: premium flows and the pool's claim stays backed by the fund.
+        let mut e = PercolatorEngine::new(cfg(), 0);
+        let _ = e.deposit(0, 1_000_000_000, 0);
+        let _ = e.deposit(1, 1_000_000, 0);
+        let obs = [
+            VenueObs { venue: 0, price: 50_000, depth: 100 },
+            VenueObs { venue: 1, price: 50_000, depth: 100 },
+            VenueObs { venue: 2, price: 50_000, depth: 100 },
+        ];
+        e.tick(&obs, CalendarState::Open, 1, 1);
+        let _ = e.open(1, 0, 5000, 1);
+        for s in 2..20 {
+            e.tick(&obs, CalendarState::Open, s, s);
+        }
+        assert!(e.insurer.pool.total_collected > 0); // lifecycle ran
+        assert_eq!(check(&e), Ok(())); // and stayed solvent
+    }
+
+    #[test]
+    fn catches_insolvency_when_fund_drawn_below_pool_without_reconcile() {
+        // The realistic failure: an integrator collects premium but forgets to
+        // reconcile, then a fund deficit is paid. With reconcile skipped, that
+        // drawdown is never recorded against the pool -> the pool's claim now
+        // exceeds the fund -> the guard must catch it.
+        let mut e = PercolatorEngine::new(cfg(), 0);
+        let _ = e.deposit(0, 1_000_000_000, 0);
+        let _ = e.deposit(1, 1_000_000, 0);
+        e.set_reconcile_enabled(false);
+        let obs = [
+            VenueObs { venue: 0, price: 50_000, depth: 100 },
+            VenueObs { venue: 1, price: 50_000, depth: 100 },
+            VenueObs { venue: 2, price: 50_000, depth: 100 },
+        ];
+        e.tick(&obs, CalendarState::Open, 1, 1);
+        let _ = e.open(1, 0, 5000, 1);
+        for s in 2..20 {
+            e.tick(&obs, CalendarState::Open, s, s);
+        }
+        let pool = e.insurer.pool.balance;
+        assert!(pool > 0);
+        // simulate a fund drawdown (deficit payout) that reconcile would have caught
+        e.insurer.engine.insurance_fund.balance.set(pool - 1);
+        assert_eq!(check(&e), Err(Violation::Insolvency));
     }
 }
