@@ -1,0 +1,13 @@
+[package]
+name = "percolator-engine"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+fixtures = []
+
+[dependencies]
+percolator = { path = "../percolator", features = ["test"] }
+percolator-insurance = { path = "../percolator/percolator-insurance", features = ["serde"] }
+percolator-feed = { path = "../percolator-feed" }
+percolator-equity = { path = "../percolator-equity" }
