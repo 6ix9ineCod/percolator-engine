@@ -6,7 +6,9 @@ use percolator_equity::marking::NameCfg;
 use percolator_equity::session::{CalendarState, Liveness};
 use percolator::LiquidationPolicy;
 use percolator_feed::{FeedCfg, FeedTick, RiskFeed};
-use percolator_insurance::{InsuredRiskEngine, PremiumParams, Result as InsResult, RiskParams};
+use percolator_insurance::{
+    InsuredRiskEngine, PremiumParams, Result as InsResult, RiskParams, MAX_ACCOUNTS,
+};
 
 /// Number of price venues the composed feed consumes.
 pub const N_VENUES: usize = 4;
@@ -44,6 +46,7 @@ pub struct PercolatorEngine {
     convert_cfg: ConvertCfg,
     last_state: EngineState,
     last_ts: u64,
+    reconcile_enabled: bool,
 }
 
 impl PercolatorEngine {
@@ -76,6 +79,27 @@ impl PercolatorEngine {
             convert_cfg: cfg.convert_cfg,
             last_state: EngineState { tick: init_tick, inputs, gates, now_slot: init_slot },
             last_ts: 0,
+            reconcile_enabled: true,
+        }
+    }
+
+    /// Toggle the pool/fund reconciliation step. Default on. Turning it off models
+    /// an integrator that collects premium but forgets to reconcile — used to prove
+    /// the solvency invariant's guard fires (see `invariants` + `redteam`).
+    pub fn set_reconcile_enabled(&mut self, v: bool) {
+        self.reconcile_enabled = v;
+    }
+
+    /// Run the insurer's premium lifecycle: collect accrued premium from every
+    /// active account into the fund (recording the real delta to the pool), then
+    /// reconcile the pool against the actual fund balance. This is the keeper crank
+    /// the composition runs each tick — without it the insurance layer is inert.
+    fn run_maintenance(&mut self, now_slot: u64) {
+        for idx in 0..MAX_ACCOUNTS as u16 {
+            let _ = self.insurer.collect_accrued_premium(idx, now_slot);
+        }
+        if self.reconcile_enabled {
+            self.insurer.reconcile_pool();
         }
     }
 
@@ -104,6 +128,7 @@ impl PercolatorEngine {
         let inputs = feed_to_engine(&tick, &self.convert_cfg);
         let gates = equity_to_engine(&eq);
         self.insurer.accrue(now_slot);
+        self.run_maintenance(now_slot);
         let st = EngineState { tick, inputs, gates, now_slot };
         self.last_state = st;
         st
@@ -242,5 +267,27 @@ mod tests {
         let mut e = seeded();
         e.tick(&[], CalendarState::Closed, 1, 1); // opens gated
         let _ = e.liquidate(1, 2); // callable; gate does not block liquidation
+    }
+
+    #[test]
+    fn premium_lifecycle_runs_pool_collects() {
+        // With the maintenance pass wired in, an open position over many slots must
+        // actually move premium into the fund/pool — proving the insurance layer is
+        // no longer inert.
+        let mut e = seeded();
+        let obs = [
+            VenueObs { venue: 0, price: 50_000, depth: 100 },
+            VenueObs { venue: 1, price: 50_000, depth: 100 },
+            VenueObs { venue: 2, price: 50_000, depth: 100 },
+        ];
+        e.tick(&obs, CalendarState::Open, 1, 1);
+        assert!(e.open(1, 0, 5000, 1).unwrap());
+        for s in 2..50 {
+            e.tick(&obs, CalendarState::Open, s, s);
+        }
+        assert!(
+            e.insurer.pool.total_collected > 0,
+            "premium never collected -> insurance still inert"
+        );
     }
 }
