@@ -35,12 +35,16 @@ liquidation and risk-reduction are never gated.
 
 ## The cross-crate invariant contract + red-team
 
-`invariants::check` enforces the composition's contract — pool accounting solvency
-(`paid_out ≤ collected`) and the **gate-protection** rule (a gated, proxy-marked
-session must hold gap protection). `redteam::search` drives the *real* composed
-engine through random adversarial action sequences (oracle moves, session crossings,
-opens, liquidations, clock jumps), checking the invariants after every step and
-**delta-debug shrinking** any break to a minimal counterexample.
+`tick()` runs the insurer's full premium lifecycle each step (accrue → collect into
+the fund → reconcile the pool), so the insurance layer actually functions — not just
+the trade/liquidation path. `invariants::check` then enforces the composition's
+contract — pool accounting (`paid_out ≤ collected`), **fund solvency**
+(`pool.balance ≤ insurance_fund.balance` — the pool's claim is backed by real fund),
+and the **gate-protection** rule (a gated, proxy-marked session must hold gap
+protection). `redteam::search` drives the *real* composed engine through random
+adversarial action sequences (oracle moves, session crossings, opens, liquidations,
+clock jumps), checking every invariant after every step and **delta-debug shrinking**
+any break to a minimal counterexample.
 
 A red-team that never finds anything is theater, so the suite includes a **negative
 control**: against a deliberately mis-configured engine (gap protection zeroed) the
@@ -56,11 +60,17 @@ trusting its "no break found" on the sound config.
   A confidence-derived degenerate `h_max = 0` triggers an internal engine overflow,
   so confidence-modulated warmup is a documented follow-up — the confidence signal
   still reaches the engine via equity's `extraction_warmup` and `mark_conf`.
+- **Solvency is robust**: with the premium lifecycle running and the bounded-oracle
+  envelope, no *unplanted* adversarial sequence could drive `pool.balance` above the
+  fund balance — liquidations fire while accounts are still solvent, so the fund
+  rarely pays a deficit. The solvency guard is therefore a regression guard, proven
+  to fire by a faithful planted control (reconcile skipped during a fund drawdown).
+  A clean red-team run is evidence the property holds, not a proof.
 
 ## Usage
 
 ```
-cargo test --features fixtures                       # 16 tests
+cargo test --features fixtures                       # 19 tests
 cargo run --features fixtures --bin engine           # composed day + red-team run
 cargo clippy --all-targets --features fixtures -- -D warnings
 ```
