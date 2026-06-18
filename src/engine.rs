@@ -4,8 +4,9 @@ use crate::convert::{equity_to_engine, feed_to_engine, ConvertCfg, EngineGates, 
 use percolator_equity::equity::{EquityCfg, EquityEngine};
 use percolator_equity::marking::NameCfg;
 use percolator_equity::session::{CalendarState, Liveness};
+use percolator::LiquidationPolicy;
 use percolator_feed::{FeedCfg, FeedTick, RiskFeed};
-use percolator_insurance::{InsuredRiskEngine, PremiumParams, RiskParams};
+use percolator_insurance::{InsuredRiskEngine, PremiumParams, Result as InsResult, RiskParams};
 
 /// Number of price venues the composed feed consumes.
 pub const N_VENUES: usize = 4;
@@ -111,6 +112,64 @@ impl PercolatorEngine {
     pub fn state(&self) -> EngineState {
         self.last_state
     }
+
+    /// Seed an account with capital (LP or trader). Mirrors sim's deposit.
+    pub fn deposit(&mut self, idx: u16, amount: u128, now_slot: u64) -> InsResult<()> {
+        self.insurer.deposit(idx, amount, now_slot)
+    }
+
+    /// Open/increase a position a-vs-b. Returns Ok(false) (a no-op) when the equity
+    /// gates forbid risk increase — naked opens are blocked in Closed/Halted/
+    /// PreEvent or for a non-Admissible name. Never blocks liquidation/reduction.
+    pub fn open(&mut self, a: u16, b: u16, size_q: i128, now_slot: u64) -> InsResult<bool> {
+        if !self.last_state.gates.allow_open {
+            return Ok(false);
+        }
+        let inp = self.last_state.inputs;
+        self.insurer.execute_trade(
+            a,
+            b,
+            inp.oracle_price,
+            now_slot,
+            size_q,
+            inp.oracle_price,
+            inp.funding_e9,
+            inp.admit_h_min,
+            inp.admit_h_max,
+            None,
+        )?;
+        Ok(true)
+    }
+
+    /// Liquidate an account at the fast price. Always allowed (risk-reducing).
+    pub fn liquidate(&mut self, idx: u16, now_slot: u64) -> InsResult<bool> {
+        let inp = self.last_state.inputs;
+        self.insurer.liquidate(
+            idx,
+            now_slot,
+            inp.oracle_price,
+            LiquidationPolicy::FullClose,
+            inp.funding_e9,
+            inp.admit_h_min,
+            inp.admit_h_max,
+            None,
+        )
+    }
+
+    /// Withdraw at the persistence-confirmed extraction price + warmup band.
+    pub fn withdraw(&mut self, idx: u16, amount: u128, now_slot: u64) -> InsResult<()> {
+        let inp = self.last_state.inputs;
+        self.insurer.withdraw(
+            idx,
+            amount,
+            inp.extraction_price,
+            now_slot,
+            inp.funding_e9,
+            inp.admit_h_min,
+            inp.admit_h_max,
+            None,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +207,40 @@ mod tests {
         let mut e = PercolatorEngine::new(cfg(), 0);
         let st = e.tick(&[], CalendarState::Closed, 1, 1);
         assert!(!st.gates.allow_open);
+    }
+
+    fn seeded() -> PercolatorEngine {
+        let mut e = PercolatorEngine::new(cfg(), 0);
+        let _ = e.deposit(0, 1_000_000_000, 0); // LP
+        let _ = e.deposit(1, 1_000_000, 0); // trader
+        e
+    }
+
+    #[test]
+    fn open_rejected_when_session_gates_it() {
+        let mut e = seeded();
+        e.tick(&[], CalendarState::Closed, 1, 1); // Closed -> allow_open=false
+        let opened = e.open(1, 0, 1000, 2).unwrap();
+        assert!(!opened); // gate held, no trade
+    }
+
+    #[test]
+    fn open_allowed_when_open_session() {
+        let mut e = seeded();
+        let obs = [
+            VenueObs { venue: 0, price: 50_000, depth: 100 },
+            VenueObs { venue: 1, price: 50_000, depth: 100 },
+            VenueObs { venue: 2, price: 50_000, depth: 100 },
+        ];
+        e.tick(&obs, CalendarState::Open, 1, 1);
+        let opened = e.open(1, 0, 1000, 2).unwrap();
+        assert!(opened);
+    }
+
+    #[test]
+    fn liquidate_runs_even_when_opens_gated() {
+        let mut e = seeded();
+        e.tick(&[], CalendarState::Closed, 1, 1); // opens gated
+        let _ = e.liquidate(1, 2); // callable; gate does not block liquidation
     }
 }

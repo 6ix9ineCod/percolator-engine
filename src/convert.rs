@@ -12,7 +12,11 @@ pub const CONF: u32 = 1_000_000;
 
 #[derive(Clone, Copy)]
 pub struct ConvertCfg {
-    pub h_max_cap: u64, // engine RiskParams.h_max (warmup band ceiling)
+    /// MUST equal the engine's `RiskParams.h_max` — the warmup band passed to
+    /// `execute_trade`/`liquidate` is the engine's configured `[0, h_max_cap]`.
+    /// A degenerate `h_max = 0` band triggers an internal engine overflow path,
+    /// so the band is the configured band, not a confidence-derived value.
+    pub h_max_cap: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,18 +38,18 @@ pub struct EngineGates {
 }
 
 /// Map a FeedTick to the engine's price/funding/admission inputs. Prices are
-/// clamped into the engine's oracle range; lower extraction confidence widens the
-/// warmup band so fresh PnL is admitted more slowly on a less-trusted price.
+/// clamped into the engine's oracle range. The admission band is the engine's
+/// configured `[0, h_max_cap]` (a degenerate `h_max = 0` overflows the engine).
+/// Confidence-modulated warmup is a documented follow-up — the confidence signal
+/// still reaches the engine via equity's `extraction_warmup` and `mark_conf`.
 pub fn feed_to_engine(tick: &FeedTick, cfg: &ConvertCfg) -> EngineInputs {
     let clamp = |p: u64| p.min(MAX_ORACLE_PRICE).max(1);
-    let gate = tick.extraction_gate.min(CONF) as u64;
-    let admit_h_max = cfg.h_max_cap - cfg.h_max_cap * gate / CONF as u64;
     EngineInputs {
         oracle_price: clamp(tick.fast_price),
         extraction_price: clamp(tick.extraction_price),
         funding_e9: tick.funding_e9,
         admit_h_min: 0,
-        admit_h_max,
+        admit_h_max: cfg.h_max_cap,
     }
 }
 
@@ -99,11 +103,13 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_widens_warmup_band() {
-        let hi = feed_to_engine(&a_tick(CONF), &cfg()).admit_h_max;
-        let lo = feed_to_engine(&a_tick(CONF / 4), &cfg()).admit_h_max;
-        assert!(lo > hi); // less confidence -> more warmup
-        assert_eq!(hi, 0); // full confidence -> no warmup
+    fn admit_band_is_the_configured_engine_band() {
+        // The band is the engine's configured [0, h_max_cap] regardless of
+        // confidence — a degenerate h_max=0 overflows the engine. Confidence
+        // reaches the engine via equity's extraction_warmup / mark_conf instead.
+        let e = feed_to_engine(&a_tick(CONF / 4), &cfg());
+        assert_eq!(e.admit_h_min, 0);
+        assert_eq!(e.admit_h_max, 100);
     }
 
     #[test]
